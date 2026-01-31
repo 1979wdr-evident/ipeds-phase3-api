@@ -2,7 +2,7 @@
   "name": "ipeds-phase3-api",
   "version": "0.1.0",
   "description": "Lightweight IPEDS API for Phase 3 Competition & Positioning",
-  "main": "server.js",
+  "main": "server.cjs",
   "scripts": {
   "start": "node server.cjs"
 },
