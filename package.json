@@ -1,0 +1,17 @@
+{
+  "name": "ipeds-phase3-api",
+  "version": "0.1.0",
+  "description": "Lightweight IPEDS API for Phase 3 Competition & Positioning",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "papaparse": "^5.4.1",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
