@@ -43,11 +43,11 @@ const completionsByYear = {};   // year → array of rows
 
 function parseCSV(filePath) {
   const csv = fs.readFileSync(filePath, "utf8");
-  const { data } = Papa.parse(csv, {
+  const parsed = Papa.parse(csv, {
     header: true,
     skipEmptyLines: true,
   });
-  return data;
+  return parsed.data;
 }
 
 function sectorLabel(sectorCode) {
@@ -92,7 +92,62 @@ Object.entries(COMPLETION_FILES).forEach(([year, filename]) => {
    Routes
 ------------------------------ */
 
-/**
- * Root – Railway health sanity check
- */
 app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "ipeds-phase3-api",
+    availableYears: Object.keys(COMPLETION_FILES).map(Number),
+    institutionCount: institutions.size,
+  });
+});
+
+app.get("/comps", (req, res) => {
+  const { cip, awlevel } = req.query;
+
+  if (!cip) {
+    return res.status(400).json({ error: "Missing required parameter: cip" });
+  }
+
+  const results = new Map();
+
+  Object.entries(completionsByYear).forEach(([year, rows]) => {
+    rows.forEach((row) => {
+      if (row.CIPCODE !== cip) return;
+      if (awlevel && row.AWLEVEL !== awlevel) return;
+
+      const unitid = row.UNITID;
+      const count = Number(row.CTOTALT || 0);
+
+      if (!results.has(unitid)) {
+        const inst = institutions.get(unitid);
+        if (!inst) return;
+
+        results.set(unitid, {
+          ...inst,
+          completions: {},
+        });
+      }
+
+      if (count > 0) {
+        results.get(unitid).completions[year] = count;
+      }
+    });
+  });
+
+  res.json({
+    cip,
+    awlevel: awlevel || null,
+    years: Object.keys(COMPLETION_FILES).map(Number),
+    institutionCount: results.size,
+    results: Array.from(results.values()),
+  });
+});
+
+/* -----------------------------
+   Start server
+------------------------------ */
+
+const server = app.listen(PORT, () => {
+  const actualPort = server.address().port;
+  console.log(`🚀 Phase 3 IPEDS API running on port ${actualPort}`);
+});
