@@ -4,8 +4,8 @@
   "description": "Lightweight IPEDS API for Phase 3 Competition & Positioning",
   "main": "server.cjs",
   "scripts": {
-  "start": "node server.cjs"
-},
+    "start": "node server.cjs"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "papaparse": "^5.4.1",
