@@ -1,6 +1,8 @@
 /* server.cjs
    IPEDS Phase 3 Comps API
-   Railway-safe, lazy-load completions, Carnegie included
+   - CIP required
+   - AWLEVEL optional
+   - Returns completions grouped by award level
 */
 
 const express = require("express");
@@ -18,6 +20,7 @@ app.use(express.json({ limit: "2mb" }));
 ------------------------------*/
 
 const PORT = process.env.PORT || 3000;
+
 const DATA_DIR = path.join(__dirname, "data", "ipeds");
 
 const HD_FILE = path.join(DATA_DIR, "HD_2023.csv");
@@ -31,11 +34,8 @@ const COMPLETIONS_BY_YEAR = {
 };
 
 const YEARS = Object.keys(COMPLETIONS_BY_YEAR)
-  .map((y) => parseInt(y, 10))
+  .map(Number)
   .sort((a, b) => a - b);
-
-const CACHE_MAX = 50;
-const cache = new Map();
 
 /* -----------------------------
    Helpers
@@ -43,7 +43,7 @@ const cache = new Map();
 
 function normalizeCip(input) {
   if (!input) return "";
-  let s = String(input).trim().replace(/[^\d.]/g, "");
+  let s = String(input).replace(/[^\d.]/g, "");
   if (!s.includes(".") && s.length >= 4) {
     s = s.slice(0, 2) + "." + s.slice(2);
   }
@@ -53,42 +53,20 @@ function normalizeCip(input) {
 }
 
 function toInt(v) {
-  const n = parseInt(String(v ?? "").trim(), 10);
+  const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : null;
-}
-
-function existsOrThrow(filePath) {
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`Missing file: ${filePath}`);
-  }
-}
-
-function safeGet(obj, ...keys) {
-  for (const k of keys) {
-    if (obj && Object.prototype.hasOwnProperty.call(obj, k)) return obj[k];
-  }
-  return undefined;
 }
 
 function streamCsv(filePath, onRow) {
   return new Promise((resolve, reject) => {
-    existsOrThrow(filePath);
-
-    const readStream = fs.createReadStream(filePath);
-
-    Papa.parse(readStream, {
+    const stream = fs.createReadStream(filePath);
+    Papa.parse(stream, {
       header: true,
       skipEmptyLines: true,
       dynamicTyping: false,
-      step: (results) => {
-        try {
-          onRow(results.data);
-        } catch (err) {
-          reject(err);
-        }
-      },
-      complete: () => resolve(),
-      error: (err) => reject(err),
+      step: (r) => onRow(r.data),
+      complete: resolve,
+      error: reject,
     });
   });
 }
@@ -97,153 +75,121 @@ function streamCsv(filePath, onRow) {
    Load Institutions (HD)
 ------------------------------*/
 
-let instByUnitid = new Map();
+let institutions = new Map();
 
-function loadInstitutions() {
+(function loadInstitutions() {
   console.log("📦 Loading HD_2023.csv…");
-  existsOrThrow(HD_FILE);
+  const csv = fs.readFileSync(HD_FILE, "utf8");
+  const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
 
-  const csvText = fs.readFileSync(HD_FILE, "utf8");
-  const parsed = Papa.parse(csvText, {
-    header: true,
-    skipEmptyLines: true,
-  });
-
-  const map = new Map();
-
-  for (const row of parsed.data) {
-    const unitid = String(safeGet(row, "UNITID") ?? "").trim();
+  for (const r of parsed.data) {
+    const unitid = String(r.UNITID || "").trim();
     if (!unitid) continue;
 
-    map.set(unitid, {
+    institutions.set(unitid, {
       unitid,
-      instnm: String(safeGet(row, "INSTNM") ?? "").trim(),
-      stabbr: String(safeGet(row, "STABBR") ?? "").trim(),
-      city: String(safeGet(row, "CITY") ?? "").trim(),
-      zip: String(safeGet(row, "ZIP") ?? "").trim(),
-      webaddr: String(safeGet(row, "WEBADDR") ?? "").trim(),
-      control: toInt(safeGet(row, "CONTROL")),
-      carnegie: toInt(safeGet(row, "CARNEGIE")), // ✅ retained + exposed
+      instnm: r.INSTNM || "",
+      stabbr: r.STABBR || "",
+      city: r.CITY || "",
+      webaddr: r.WEBADDR || "",
+      control: toInt(r.CONTROL),
+      carnegie: r.CARNEGIE || null,
     });
   }
 
-  instByUnitid = map;
-  console.log(`✅ Institutions loaded: ${instByUnitid.size}`);
-}
+  console.log(`✅ Institutions loaded: ${institutions.size}`);
+})();
 
 /* -----------------------------
    Routes
 ------------------------------*/
 
-app.get("/", (req, res) => {
-  res.send(
-    "IPEDS Phase 3 Comps API is running. Try /health or /api/comps?cip=51.2001&awlevel=7"
-  );
+app.get("/", (_, res) => {
+  res.send("IPEDS Phase 3 Comps API running. Try /health or /api/comps?cip=51.2001");
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", (_, res) => {
   res.json({
     ok: true,
-    institutionsLoaded: instByUnitid.size,
     years: YEARS,
+    institutionsLoaded: institutions.size,
   });
 });
 
+/**
+ * GET /api/comps?cip=51.2001
+ * GET /api/comps?cip=51.2001&awlevel=7   (optional filter)
+ */
 app.get("/api/comps", async (req, res) => {
   try {
     const cip = normalizeCip(req.query.cip);
     const awlevel = toInt(req.query.awlevel);
+    const filterByAw = Number.isFinite(awlevel);
 
     if (!cip) {
       return res.status(400).json({ error: "Missing required query param: cip" });
-    }
-    if (!awlevel) {
-      return res
-        .status(400)
-        .json({ error: "Missing or invalid query param: awlevel" });
-    }
-
-    const cacheKey = `${cip}|${awlevel}`;
-    if (cache.has(cacheKey)) {
-      return res.json(cache.get(cacheKey));
     }
 
     const acc = new Map();
 
     for (const year of YEARS) {
       const filePath = COMPLETIONS_BY_YEAR[year];
-      console.log(`📦 Streaming ${year} for CIP ${cip}, AWLEVEL ${awlevel}`);
+      console.log(`📦 Streaming ${year} (cip=${cip})`);
 
       await streamCsv(filePath, (row) => {
-        const unitid = String(safeGet(row, "UNITID") ?? "").trim();
-        if (!unitid) return;
-
-        const rowCip = normalizeCip(safeGet(row, "CIPCODE"));
+        const rowCip = normalizeCip(row.CIPCODE || row.CIPCODE6);
         if (rowCip !== cip) return;
 
-        const rowAw = toInt(safeGet(row, "AWLEVEL"));
-        if (rowAw !== awlevel) return;
+        const rowAw = toInt(row.AWLEVEL);
+        if (filterByAw && rowAw !== awlevel) return;
 
-        const count = toInt(safeGet(row, "CTOTALT")) ?? 0;
+        const unitid = String(row.UNITID || "").trim();
+        if (!unitid) return;
 
-        if (!acc.has(unitid)) {
-          acc.set(unitid, { completions: {}, total: 0 });
+        const count = toInt(row.CTOTALT) || 0;
+
+        if (!acc.has(unitid)) acc.set(unitid, {});
+        const instRec = acc.get(unitid);
+
+        if (!instRec[rowAw]) {
+          instRec[rowAw] = { completions: {}, total: 0 };
         }
 
-        acc.get(unitid).completions[year] =
-          (acc.get(unitid).completions[year] ?? 0) + count;
-        acc.get(unitid).total += count;
+        instRec[rowAw].completions[year] =
+          (instRec[rowAw].completions[year] || 0) + count;
+        instRec[rowAw].total += count;
       });
     }
 
     const results = [];
 
-    for (const [unitid, rec] of acc.entries()) {
-      const inst = instByUnitid.get(unitid);
-
+    for (const [unitid, awards] of acc.entries()) {
+      const inst = institutions.get(unitid) || {};
       results.push({
         unitid,
-        instnm: inst?.instnm || "(unknown)",
-        stabbr: inst?.stabbr || "",
-        control: inst?.control ?? null,
-        carnegie: inst?.carnegie ?? null, // ✅ FIXED
-        webaddr: inst?.webaddr || "",
-        completions: rec.completions,
-        total: rec.total,
+        instnm: inst.instnm || "(unknown)",
+        stabbr: inst.stabbr || "",
+        control: inst.control ?? null,
+        carnegie: inst.carnegie ?? null,
+        webaddr: inst.webaddr || "",
+        awards, // keyed by AWLEVEL
       });
     }
 
-    results.sort((a, b) => (b.total || 0) - (a.total || 0));
-
-    const payload = {
+    res.json({
       cip,
-      awlevel,
       years: YEARS,
       results,
-    };
-
-    cache.set(cacheKey, payload);
-    if (cache.size > CACHE_MAX) {
-      cache.delete(cache.keys().next().value);
-    }
-
-    res.json(payload);
+    });
   } catch (err) {
-    console.error("Comps error:", err);
+    console.error(err);
     res.status(500).json({ error: "Server error", detail: err.message });
   }
 });
 
 /* -----------------------------
-   Boot
+   Start Server
 ------------------------------*/
-
-try {
-  loadInstitutions();
-} catch (err) {
-  console.error("❌ Failed to load institutions:", err);
-  process.exit(1);
-}
 
 const server = app.listen(PORT, () => {
   console.log(`🚀 Phase 3 IPEDS API running on port ${server.address().port}`);
