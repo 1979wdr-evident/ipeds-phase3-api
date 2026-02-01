@@ -93,7 +93,12 @@ let institutions = new Map();
       city: r.CITY || "",
       webaddr: r.WEBADDR || "",
       control: toInt(r.CONTROL),
+
+      // 🔹 legacy Carnegie (leave intact)
       carnegie: r.CARNEGIE || null,
+
+      // 🔹 modern Carnegie 2021 Basic Classification
+      c21basic: toInt(r.C21BASIC),
     });
   }
 
@@ -170,9 +175,13 @@ app.get("/api/comps", async (req, res) => {
         instnm: inst.instnm || "(unknown)",
         stabbr: inst.stabbr || "",
         control: inst.control ?? null,
+
+        // 🔹 both included
         carnegie: inst.carnegie ?? null,
+        c21basic: inst.c21basic ?? null,
+
         webaddr: inst.webaddr || "",
-        awards, // keyed by AWLEVEL
+        awards,
       });
     }
 
