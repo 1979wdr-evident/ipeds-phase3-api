@@ -23,7 +23,9 @@ const PORT = process.env.PORT || 3000;
 
 const DATA_DIR = path.join(__dirname, "data", "ipeds");
 
-const HD_FILE = path.join(DATA_DIR, "HD_2024.csv");
+const HD_FILE = fs.existsSync(path.join(DATA_DIR, "HD_2025.csv"))
+  ? path.join(DATA_DIR, "HD_2025.csv")
+  : path.join(DATA_DIR, "HD_2024.csv");
 
 const COMPLETIONS_BY_YEAR = {
   2019: path.join(DATA_DIR, "C_2019.csv"),
@@ -32,6 +34,7 @@ const COMPLETIONS_BY_YEAR = {
   2022: path.join(DATA_DIR, "C_2022.csv"),
   2023: path.join(DATA_DIR, "C_2023.csv"),
   2024: path.join(DATA_DIR, "C_2024.csv"),
+  2025: path.join(DATA_DIR, "C_2025.csv"),
 };
 
 const YEARS = Object.keys(COMPLETIONS_BY_YEAR)
@@ -79,7 +82,7 @@ function streamCsv(filePath, onRow) {
 let institutions = new Map();
 
 (function loadInstitutions() {
-  console.log("📦 Loading HD_2024.csv…");
+  console.log(`📦 Loading ${path.basename(HD_FILE)}…`);
   const csv = fs.readFileSync(HD_FILE, "utf8");
   const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
 
