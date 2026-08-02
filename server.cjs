@@ -61,6 +61,16 @@ function toInt(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+/** Strip UTF-8 BOM from header keys (common when NCES CSVs are saved from Excel/Windows). */
+function normalizeRowKeys(row) {
+  if (!row || typeof row !== "object") return {};
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[String(k).replace(/^\uFEFF/, "")] = v;
+  }
+  return out;
+}
+
 function streamCsv(filePath, onRow) {
   return new Promise((resolve, reject) => {
     const stream = fs.createReadStream(filePath);
@@ -68,7 +78,7 @@ function streamCsv(filePath, onRow) {
       header: true,
       skipEmptyLines: true,
       dynamicTyping: false,
-      step: (r) => onRow(r.data),
+      step: (r) => onRow(normalizeRowKeys(r.data)),
       complete: resolve,
       error: reject,
     });
@@ -83,10 +93,11 @@ let institutions = new Map();
 
 (function loadInstitutions() {
   console.log(`📦 Loading ${path.basename(HD_FILE)}…`);
-  const csv = fs.readFileSync(HD_FILE, "utf8");
+  const csv = fs.readFileSync(HD_FILE, "utf8").replace(/^\uFEFF/, "");
   const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
 
-  for (const r of parsed.data) {
+  for (const raw of parsed.data) {
+    const r = normalizeRowKeys(raw);
     const unitid = String(r.UNITID || "").trim();
     if (!unitid) continue;
 
