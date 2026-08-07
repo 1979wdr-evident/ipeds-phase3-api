@@ -3,6 +3,9 @@
    - CIP required
    - AWLEVEL optional
    - Returns completions grouped by award level
+
+   Startup builds an in-memory CIP index so /api/comps is O(matches),
+   not a full re-scan of ~370MB CSV on every request.
 */
 
 const express = require("express");
@@ -92,7 +95,7 @@ function streamCsv(filePath, onRow) {
 let institutions = new Map();
 
 (function loadInstitutions() {
-  console.log(`📦 Loading ${path.basename(HD_FILE)}…`);
+  console.log(`Loading ${path.basename(HD_FILE)}…`);
   const csv = fs.readFileSync(HD_FILE, "utf8").replace(/^\uFEFF/, "");
   const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
 
@@ -108,31 +111,155 @@ let institutions = new Map();
       city: r.CITY || "",
       webaddr: r.WEBADDR || "",
       control: toInt(r.CONTROL),
-
-      // 🔹 legacy Carnegie (leave intact)
       carnegie: r.CARNEGIE || null,
-
-      // 🔹 modern Carnegie 2021 Basic Classification
       c21basic: toInt(r.C21BASIC),
     });
   }
 
-  console.log(`✅ Institutions loaded: ${institutions.size}`);
+  console.log(`Institutions loaded: ${institutions.size}`);
 })();
+
+/* -----------------------------
+   CIP index (built once at startup)
+   cip -> Map(unitid -> awards)
+------------------------------*/
+
+/** @type {Map<string, Map<string, object>>} */
+let cipIndex = new Map();
+let indexReady = false;
+let indexError = null;
+let indexBuiltAt = null;
+let indexCipCount = 0;
+let indexRowCount = 0;
+
+function ensureAwardBucket(instRec, rowAw) {
+  if (!instRec[rowAw]) {
+    instRec[rowAw] = { completions: {}, total: 0 };
+  }
+  return instRec[rowAw];
+}
+
+function ingestCompletionRow(row, year) {
+  const cip = normalizeCip(row.CIPCODE || row.CIPCODE6);
+  if (!cip) return;
+
+  const unitid = String(row.UNITID || "").trim();
+  if (!unitid) return;
+
+  const rowAw = toInt(row.AWLEVEL);
+  if (rowAw == null) return;
+
+  const count = toInt(row.CTOTALT) || 0;
+  indexRowCount += 1;
+
+  let byUnit = cipIndex.get(cip);
+  if (!byUnit) {
+    byUnit = new Map();
+    cipIndex.set(cip, byUnit);
+  }
+
+  let instRec = byUnit.get(unitid);
+  if (!instRec) {
+    instRec = {};
+    byUnit.set(unitid, instRec);
+  }
+
+  const bucket = ensureAwardBucket(instRec, rowAw);
+  bucket.completions[year] = (bucket.completions[year] || 0) + count;
+  bucket.total += count;
+}
+
+async function buildCipIndex() {
+  const t0 = Date.now();
+  console.log("Building CIP completions index (one-time scan)…");
+  cipIndex = new Map();
+  indexRowCount = 0;
+
+  for (const year of YEARS) {
+    const filePath = COMPLETIONS_BY_YEAR[year];
+    if (!fs.existsSync(filePath)) {
+      console.warn(`Missing completions file for ${year}: ${filePath}`);
+      continue;
+    }
+    console.log(`Indexing ${year}…`);
+    await streamCsv(filePath, (row) => ingestCompletionRow(row, year));
+  }
+
+  indexCipCount = cipIndex.size;
+  indexBuiltAt = new Date().toISOString();
+  indexReady = true;
+  console.log(
+    `CIP index ready: ${indexCipCount} CIPs, ${indexRowCount} rows, ${Date.now() - t0}ms`
+  );
+}
+
+/**
+ * Deep-clone awards so callers cannot mutate the shared index.
+ * @param {object} awards
+ */
+function cloneAwards(awards) {
+  const out = {};
+  for (const [aw, block] of Object.entries(awards || {})) {
+    out[aw] = {
+      total: block.total || 0,
+      completions: { ...(block.completions || {}) },
+    };
+  }
+  return out;
+}
+
+function buildResultsForCip(cip, awlevelFilter) {
+  const byUnit = cipIndex.get(cip);
+  if (!byUnit || byUnit.size === 0) return [];
+
+  const filterByAw = Number.isFinite(awlevelFilter);
+  const results = [];
+
+  for (const [unitid, awards] of byUnit.entries()) {
+    let awardsOut = awards;
+    if (filterByAw) {
+      const key = String(awlevelFilter);
+      const block = awards[awlevelFilter] || awards[key];
+      if (!block) continue;
+      awardsOut = { [awlevelFilter]: block };
+    }
+
+    const inst = institutions.get(unitid) || {};
+    results.push({
+      unitid,
+      instnm: inst.instnm || "(unknown)",
+      stabbr: inst.stabbr || "",
+      control: inst.control ?? null,
+      carnegie: inst.carnegie ?? null,
+      c21basic: inst.c21basic ?? null,
+      webaddr: inst.webaddr || "",
+      awards: cloneAwards(awardsOut),
+    });
+  }
+
+  return results;
+}
 
 /* -----------------------------
    Routes
 ------------------------------*/
 
 app.get("/", (_, res) => {
-  res.send("IPEDS Phase 3 Comps API running. Try /health or /api/comps?cip=51.2001");
+  res.send(
+    "IPEDS Phase 3 Comps API running. Try /health or /api/comps?cip=51.2001"
+  );
 });
 
 app.get("/health", (_, res) => {
   res.json({
     ok: true,
+    ready: indexReady,
     years: YEARS,
     institutionsLoaded: institutions.size,
+    cipCount: indexCipCount,
+    indexedRows: indexRowCount,
+    indexBuiltAt,
+    indexError,
   });
 });
 
@@ -140,65 +267,24 @@ app.get("/health", (_, res) => {
  * GET /api/comps?cip=51.2001
  * GET /api/comps?cip=51.2001&awlevel=7   (optional filter)
  */
-app.get("/api/comps", async (req, res) => {
+app.get("/api/comps", (req, res) => {
   try {
+    if (!indexReady) {
+      return res.status(503).json({
+        error: "Index still building",
+        detail: "Retry in a few seconds",
+        indexError,
+      });
+    }
+
     const cip = normalizeCip(req.query.cip);
     const awlevel = toInt(req.query.awlevel);
-    const filterByAw = Number.isFinite(awlevel);
 
     if (!cip) {
       return res.status(400).json({ error: "Missing required query param: cip" });
     }
 
-    const acc = new Map();
-
-    for (const year of YEARS) {
-      const filePath = COMPLETIONS_BY_YEAR[year];
-      console.log(`📦 Streaming ${year} (cip=${cip})`);
-
-      await streamCsv(filePath, (row) => {
-        const rowCip = normalizeCip(row.CIPCODE || row.CIPCODE6);
-        if (rowCip !== cip) return;
-
-        const rowAw = toInt(row.AWLEVEL);
-        if (filterByAw && rowAw !== awlevel) return;
-
-        const unitid = String(row.UNITID || "").trim();
-        if (!unitid) return;
-
-        const count = toInt(row.CTOTALT) || 0;
-
-        if (!acc.has(unitid)) acc.set(unitid, {});
-        const instRec = acc.get(unitid);
-
-        if (!instRec[rowAw]) {
-          instRec[rowAw] = { completions: {}, total: 0 };
-        }
-
-        instRec[rowAw].completions[year] =
-          (instRec[rowAw].completions[year] || 0) + count;
-        instRec[rowAw].total += count;
-      });
-    }
-
-    const results = [];
-
-    for (const [unitid, awards] of acc.entries()) {
-      const inst = institutions.get(unitid) || {};
-      results.push({
-        unitid,
-        instnm: inst.instnm || "(unknown)",
-        stabbr: inst.stabbr || "",
-        control: inst.control ?? null,
-
-        // 🔹 both included
-        carnegie: inst.carnegie ?? null,
-        c21basic: inst.c21basic ?? null,
-
-        webaddr: inst.webaddr || "",
-        awards,
-      });
-    }
+    const results = buildResultsForCip(cip, awlevel);
 
     res.json({
       cip,
@@ -216,5 +302,10 @@ app.get("/api/comps", async (req, res) => {
 ------------------------------*/
 
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Phase 3 IPEDS API running on port ${server.address().port}`);
+  console.log(`Phase 3 IPEDS API listening on port ${server.address().port}`);
+});
+
+buildCipIndex().catch((err) => {
+  indexError = err?.message || String(err);
+  console.error("Failed to build CIP index:", err);
 });
